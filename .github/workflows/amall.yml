@@ -1,0 +1,210 @@
+name: Build llama.cpp with CUDA (Optimized)
+
+on:
+  schedule:
+    # Berjalan harian pada pukul 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_hash: ${{ steps.check.outputs.release_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new llama.cpp release
+        id: check
+        run: |
+          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
+          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
+          
+          echo "Latest llama.cpp release: $LATEST_RELEASE"
+          echo "Release hash: $RELEASE_HASH"
+          
+          if git tag | grep -q "^${LATEST_RELEASE}$"; then
+            echo "Release $LATEST_RELEASE already built"
+            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+              echo "Force build enabled, building anyway"
+              echo "should_build=true" >> $GITHUB_OUTPUT
+            else
+              echo "should_build=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "New release detected: $LATEST_RELEASE"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+  build:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ${{ matrix.arch.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.8.1']
+        arch:
+          - { suffix: amd64, runs_on: ubuntu-latest }
+          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
+        include:
+          - cuda_version: '12.8.1'
+            cuda_version_short: '12.8'
+            cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
+            # OPTIMASI 1: Menghapus '-virtual' (JIT) & membatasi target GPU ke ekosistem Colab & Cloud (T4, A100, RTX 3000, L4)
+            # 75: T4 | 80: A100 | 86: RTX 30xx | 89: L4/RTX 40xx. (Hapus yang tidak perlu untuk mempercepat build)
+            architectures: '75;80;86;89'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        run: |
+          echo "=== Initial Disk Space ==="
+          df -h
+          sudo apt-get remove -y '^aspnetcore-.*' || true
+          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
+          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+          sudo apt-get remove -y 'php.*' --fix-missing || true
+          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
+          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af || true
+          echo "=== After Cleanup ==="
+          df -h
+
+      - name: Build llama.cpp with CUDA
+        run: |
+          docker pull nvidia/cuda:${{ matrix.cuda_tag }}
+          
+          docker run --rm \
+            -v $PWD:/workspace \
+            nvidia/cuda:${{ matrix.cuda_tag }} \
+            bash -c "
+              set -e
+              
+              echo '=== Installing minimal dependencies ==='
+              apt-get update -qq
+              apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
+              apt-get clean
+              rm -rf /var/lib/apt/lists/*
+              
+              echo '=== Cloning llama.cpp ==='
+              cd /workspace
+              git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
+                (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
+              cd llama.cpp
+              
+              echo '=== Configuring build with Ninja ==='
+              export LIBRARY_PATH=\"/usr/local/cuda/lib64/stubs\${LIBRARY_PATH:+:\$LIBRARY_PATH}\"
+              ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+              
+              cmake -B build -S . \
+                -G Ninja \
+                -DGGML_CUDA=ON \
+                -DCMAKE_CUDA_ARCHITECTURES='${{ matrix.architectures }}' \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_SHARED_LIBS=ON \
+                -DGGML_NATIVE=OFF \
+                -DGGML_AVX2=ON \
+                -DGGML_FMA=ON \
+                -DGGML_F16C=ON \
+                -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=OFF \
+                -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
+                -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
+              
+              echo '=== Building with Ninja ==='
+              cmake --build build --config Release -j\$(nproc)
+              
+              echo '=== Copying binaries ==='
+              cd /workspace
+              mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
+              cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
+              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name \"*.so*\" -exec strip {} \; 2>/dev/null || true
+
+              echo '=== Creating version info ==='
+              echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+
+              echo '=== Build complete ==='
+              ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
+              rm -rf llama.cpp
+            "
+          
+          docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
+          sudo chown -R \$(id -u):\$(id -g) \$PWD
+
+      - name: Create tarball
+        run: |
+          cd binaries
+          tar -czf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}.tar.gz cuda-${{ matrix.cuda_version_short }}
+          ls -lh *.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
+          path: binaries/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA (Optimized)
+          body: |
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support (Highly Optimized)
+            
+            Biner pra-kompilasi llama.cpp dengan optimasi performa tinggi untuk Google Colab & Infrastruktur Cloud.
+            
+            ## Optimasi Utama:
+            - **SASS Machine Code Compilation**: Menghilangkan `-virtual` (PTX) untuk memangkas latensi awal model saat dijalankan.
+            - **Targeted Architectures**: `75` (T4), `80` (A100), `86` (RTX 30xx), `89` (L4) untuk efisiensi ukuran file biner dan kecepatan build.
+            - **Link-Time Optimization (LTO)**: Mengaktifkan optimasi interprosedural untuk kompilasi biner yang lebih efisien.
+            - **CPU Vectorization**: Mengaktifkan `AVX2`, `FMA`, dan `F16C` secara eksplisit untuk mempercepat proses *prefill/tokenisasi*.
+          files: release-assets/*
+          draft: false
+          prerelease: false
