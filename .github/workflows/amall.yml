@@ -65,8 +65,8 @@ jobs:
           - cuda_version: '12.8.1'
             cuda_version_short: '12.8'
             cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
-            # OPTIMASI 1: Menghapus '-virtual' (JIT) & membatasi target GPU ke ekosistem Colab & Cloud (T4, A100, RTX 3000, L4)
-            # 75: T4 | 80: A100 | 86: RTX 30xx | 89: L4/RTX 40xx. (Hapus yang tidak perlu untuk mempercepat build)
+            # Menghapus '-virtual' (JIT) & membatasi ke arsitektur GPU utama di Colab & Cloud (T4, A100, RTX 3000, L4)
+            # 75: T4 | 80: A100 | 86: RTX 30xx | 89: L4/RTX 40xx
             architectures: '75;80;86;89'
     
     steps:
@@ -140,7 +140,7 @@ jobs:
               cd /workspace
               mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
               cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name \"*.so*\" -exec strip {} \; 2>/dev/null || true
+              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name '*.so*' -exec strip {} \; 2>/dev/null || true
 
               echo '=== Creating version info ==='
               echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
@@ -155,7 +155,7 @@ jobs:
             "
           
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          sudo chown -R \$(id -u):\$(id -g) \$PWD
+          sudo chown -R $(id -u):$(id -g) $PWD
 
       - name: Create tarball
         run: |
